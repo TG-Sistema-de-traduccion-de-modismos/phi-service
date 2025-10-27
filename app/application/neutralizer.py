@@ -1,4 +1,5 @@
 import re
+from difflib import SequenceMatcher
 from app.infrastructure.phi_model_client import PhiModelClient
 from app.core.logging_config import logger
 
@@ -8,7 +9,6 @@ class PhiNeutralizer:
         logger.info("PhiNeutralizer inicializado con cliente de modelo remoto")
 
     def reemplazar_modismo_manual(self, frase: str, modismo: str, significado: str) -> str:
-   
         def mantener_caso(original, reemplazo):
             if original.isupper():
                 return reemplazo.upper()
@@ -65,15 +65,71 @@ class PhiNeutralizer:
         logger.warning(f"✗ No se encontró '{modismo}' ni variaciones en la frase")
         return frase
 
-    async def neutralizar(self, frase: str, significado: dict) -> str:
+    def detectar_cambios(self, original: str, neutralizada: str) -> list:
+        """
+        Compara palabra por palabra y retorna las palabras cambiadas con sus
+        posiciones exactas (índices de caracteres) en la frase neutralizada.
+        """
+        # Tokenizar manteniendo las posiciones
+        def tokenizar_con_posiciones(texto):
+            tokens = []
+            for match in re.finditer(r'\w+|[^\w\s]', texto, re.UNICODE):
+                tokens.append({
+                    'palabra': match.group(),
+                    'inicio': match.start(),
+                    'fin': match.end()
+                })
+            return tokens
+        
+        tokens_original = [t['palabra'] for t in tokenizar_con_posiciones(original)]
+        tokens_neutralizada_con_pos = tokenizar_con_posiciones(neutralizada)
+        tokens_neutralizada = [t['palabra'] for t in tokens_neutralizada_con_pos]
+        
+        # Usar SequenceMatcher para alinear las diferencias
+        matcher = SequenceMatcher(None, tokens_original, tokens_neutralizada)
+        cambios = []
+        indices_ya_agregados = set()
+        
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'replace':
+                # Agregar todas las palabras nuevas del reemplazo con sus posiciones
+                for idx in range(j1, j2):
+                    if idx not in indices_ya_agregados:
+                        token_info = tokens_neutralizada_con_pos[idx]
+                        cambios.append({
+                            'palabra': token_info['palabra'],
+                            'indice_inicio': token_info['inicio'],
+                            'indice_fin': token_info['fin']
+                        })
+                        indices_ya_agregados.add(idx)
+                        logger.info(f"Cambio: '{token_info['palabra']}' en [{token_info['inicio']}:{token_info['fin']}]")
+            
+            elif tag == 'insert':
+                # Agregar palabras insertadas con sus posiciones
+                for idx in range(j1, j2):
+                    if idx not in indices_ya_agregados:
+                        token_info = tokens_neutralizada_con_pos[idx]
+                        cambios.append({
+                            'palabra': token_info['palabra'],
+                            'indice_inicio': token_info['inicio'],
+                            'indice_fin': token_info['fin']
+                        })
+                        indices_ya_agregados.add(idx)
+                        logger.info(f"Inserción: '{token_info['palabra']}' en [{token_info['inicio']}:{token_info['fin']}]")
+        
+        return cambios
+
+    async def neutralizar(self, frase: str, significado: dict) -> tuple[str, list]:
+        """
+        Retorna (frase_neutralizada, lista_de_cambios_con_posiciones)
+        """
         if not significado or not isinstance(significado, dict):
             logger.warning("Sin significados proporcionados, retornando frase original")
-            return frase
+            return frase, []
         
         # Paso 1: Reemplazar TODOS los modismos manualmente
         frase_modificada = frase
         reemplazos_realizados = []
-        modismos_no_encontrados = []
         
         for modismo, significado_str in significado.items():
             frase_antes = frase_modificada
@@ -84,21 +140,24 @@ class PhiNeutralizer:
             # Verificar si realmente se hizo un cambio
             if frase_antes != frase_modificada:
                 reemplazos_realizados.append(f"{modismo}→{significado_str}")
+                logger.info(f"✓ Reemplazado: {modismo} → {significado_str}")
             else:
-                modismos_no_encontrados.append(modismo)
-                logger.warning(f"Modismo '{modismo}' no encontrado en la frase (puede estar conjugado diferente)")
+                logger.warning(f"✗ No encontrado: {modismo}")
         
         # Si no se hizo ningún reemplazo, devolver original
         if not reemplazos_realizados:
             logger.warning("Ningún modismo pudo ser reemplazado")
-            return frase
+            return frase, []
         
-        logger.info(f"Reemplazos manuales: {', '.join(reemplazos_realizados)}")
-        if modismos_no_encontrados:
-            logger.info(f"No encontrados: {', '.join(modismos_no_encontrados)}")
         logger.info(f"Frase con reemplazos: {frase_modificada}")
         
         # Paso 2: Ajustar gramática usando el modelo remoto
         frase_final = await self.model_client.corregir_gramatica(frase_modificada)
+        logger.info(f"Frase final corregida: {frase_final}")
         
-        return frase_final
+        # Paso 3: Detectar palabras que cambiaron con sus posiciones exactas
+        cambios = self.detectar_cambios(frase, frase_final)
+        
+        logger.info(f"Total de palabras modificadas: {len(cambios)}")
+        
+        return frase_final, cambios
